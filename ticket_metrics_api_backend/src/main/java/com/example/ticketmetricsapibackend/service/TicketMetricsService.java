@@ -1,12 +1,12 @@
 package com.example.ticketmetricsapibackend.service;
 
+import com.example.ticketmetricsapibackend.dto.TicketMetricEntry;
 import com.example.ticketmetricsapibackend.dto.TicketMetricsResponse;
 import com.example.ticketmetricsapibackend.exception.BadRequestException;
 import com.example.ticketmetricsapibackend.exception.UnprocessableEntityException;
 import io.swagger.v3.oas.annotations.media.Schema;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -16,13 +16,20 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 /**
  * PUBLIC_INTERFACE
  * Service that processes an uploaded Excel file and computes ticket metrics.
+ * Also provides retrieval of previously computed metrics with optional filtering.
  */
 @Service
 public class TicketMetricsService {
+
+    // Simple in-memory storage for metrics entries to support GET filtering.
+    // In a production system, this would be a repository/database.
+    private final List<TicketMetricEntry> metricsStore = new ArrayList<>();
 
     // Expected columns (flexible: will try to find by header names)
     @Schema(description = "Logical header names expected in the uploaded XLSX")
@@ -33,6 +40,8 @@ public class TicketMetricsService {
     /**
      * PUBLIC_INTERFACE
      * Parse and compute metrics from the provided Excel file.
+     * Additionally stores an entry into the in-memory store without specific application/month context.
+     * Clients may re-upload per application/month file if they need scoping.
      * @param file uploaded .xlsx file
      * @return TicketMetricsResponse with computed metrics
      */
@@ -98,6 +107,9 @@ public class TicketMetricsService {
 
             String remarks = buildRemarks(total, resolvedCount, slaPct);
 
+            // Store a generic entry (no app/month context known at upload entrypoint)
+            metricsStore.add(new TicketMetricEntry(null, null, total, round2(slaPct), round2(mttr)));
+
             return new TicketMetricsResponse(total, round2(slaPct), round2(mttr), remarks, details);
 
         } catch (UnprocessableEntityException e) {
@@ -105,6 +117,34 @@ public class TicketMetricsService {
         } catch (Exception e) {
             throw new UnprocessableEntityException("Unable to parse Excel file", e);
         }
+    }
+
+    /**
+     * PUBLIC_INTERFACE
+     * Returns metrics filtered by optional application and month.
+     * If both are null, returns all entries. If no matches, returns an empty list.
+     * @param application optional application name to filter (case-insensitive)
+     * @param month optional month in yyyy-MM format
+     * @return list of entries
+     */
+    public List<TicketMetricEntry> getMetrics(String application, String month) {
+        List<TicketMetricEntry> filtered = new ArrayList<>();
+        for (TicketMetricEntry entry : metricsStore) {
+            if (application != null && !application.isBlank()) {
+                String a = entry.getApplication();
+                if (a == null || !a.equalsIgnoreCase(application)) {
+                    continue;
+                }
+            }
+            if (month != null && !month.isBlank()) {
+                String m = entry.getMonth();
+                if (m == null || !m.equals(month)) {
+                    continue;
+                }
+            }
+            filtered.add(entry);
+        }
+        return filtered;
     }
 
     private void validateFile(MultipartFile file) {
@@ -136,9 +176,9 @@ public class TicketMetricsService {
         for (Cell cell : headerRow) {
             String val = getStringCell(cell);
             if (val == null) continue;
-            String norm = val.trim().toLowerCase();
+            String norm = val.trim().toLowerCase(Locale.ROOT);
             for (String exp : expectedNames) {
-                if (norm.equals(exp.toLowerCase())) {
+                if (norm.equals(exp.toLowerCase(Locale.ROOT))) {
                     return cell.getColumnIndex();
                 }
             }
