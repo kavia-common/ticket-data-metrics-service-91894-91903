@@ -13,6 +13,9 @@ import java.util.Map;
 
 /**
  * Handles application-wide exceptions and returns structured error responses.
+ * Note: Upload flow tolerates missing/partial headers and defaults values instead of throwing 422.
+ * 400 is reserved for invalid uploads (missing/empty/unsupported file), and
+ * 422 is reserved strictly for corrupt files that cannot be opened.
  */
 @ControllerAdvice
 @Hidden

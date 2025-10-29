@@ -16,9 +16,7 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.Month;
 import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
+import java.util.*;
 
 /**
  * PUBLIC_INTERFACE
@@ -57,23 +55,25 @@ public class TicketMetricsService {
 
         try (InputStream is = file.getInputStream(); Workbook workbook = new XSSFWorkbook(is)) {
             if (workbook.getNumberOfSheets() == 0) {
+                // Truly corrupt/invalid Excel
                 throw new UnprocessableEntityException("Excel has no sheets");
             }
             Sheet sheet = workbook.getSheetAt(0);
-            if (sheet.getPhysicalNumberOfRows() < 2) {
-                throw new UnprocessableEntityException("Excel has no data rows");
+            if (sheet == null) {
+                throw new UnprocessableEntityException("Unable to open first sheet");
             }
+            // If there's only a header row or empty, treat as empty dataset -> defaults
+            boolean hasAtLeastTwoRows = sheet.getPhysicalNumberOfRows() >= 2;
 
-            // Map headers
+            // Map headers defensively (case-insensitive, tolerant to missing)
             Row headerRow = sheet.getRow(sheet.getFirstRowNum());
-            int colId = findColumnIndex(headerRow, "id");
-            int colCreated = findColumnIndex(headerRow, "created_at", "created", "opened_at");
-            int colResolved = findColumnIndex(headerRow, "resolved_at", "resolved", "closed_at");
-            int colPriority = findColumnIndex(headerRow, "priority");
-            int colSlaHours = findColumnIndex(headerRow, "sla_hours", "sla", "target_hours");
+            HeaderMap headerMap = mapHeaders(headerRow);
 
-            if (colId == -1 || colCreated == -1) {
-                throw new UnprocessableEntityException("Required headers missing: need at least id, created_at");
+            if (!hasAtLeastTwoRows) {
+                // No data rows, return defaults instead of 422
+                String remarks = buildRemarks(0, 0, 0.0);
+                metricsStore.add(new TicketMetricEntry(null, null, 0, 0.0, 0.0));
+                return new TicketMetricsResponse(0, 0.0, 0.0, remarks, details);
             }
 
             // Iterate rows
@@ -81,11 +81,19 @@ public class TicketMetricsService {
                 Row row = sheet.getRow(r);
                 if (row == null) continue;
 
+                // If there's an ID column but cell is blank, still count but note detail
+                if (headerMap.colId != -1) {
+                    String idStr = safeString(row.getCell(headerMap.colId));
+                    if (idStr == null || idStr.isBlank()) {
+                        details.add("Row " + (r + 1) + ": missing id");
+                    }
+                }
+
                 total++;
 
-                LocalDateTime created = getDateCell(row.getCell(colCreated));
-                LocalDateTime resolved = (colResolved != -1) ? getDateCell(row.getCell(colResolved)) : null;
-                Double slaHours = (colSlaHours != -1) ? getNumericCell(row.getCell(colSlaHours)) : null;
+                LocalDateTime created = (headerMap.colCreated != -1) ? getDateCell(row.getCell(headerMap.colCreated)) : null;
+                LocalDateTime resolved = (headerMap.colResolved != -1) ? getDateCell(row.getCell(headerMap.colResolved)) : null;
+                Double slaHours = (headerMap.colSlaHours != -1) ? getNumericCell(row.getCell(headerMap.colSlaHours)) : null;
 
                 // MTTR
                 if (created != null && resolved != null) {
@@ -94,7 +102,7 @@ public class TicketMetricsService {
                     resolvedCount++;
                 }
 
-                // SLA
+                // SLA adherence
                 if (slaHours != null && created != null && resolved != null) {
                     double actual = Duration.between(created, resolved).toMinutes() / 60.0;
                     if (actual <= slaHours + 1e-9) {
@@ -114,8 +122,10 @@ public class TicketMetricsService {
             return new TicketMetricsResponse(total, round2(slaPct), round2(mttr), remarks, details);
 
         } catch (UnprocessableEntityException e) {
+            // Propagate known 422 conditions (e.g., corrupt workbook)
             throw e;
         } catch (Exception e) {
+            // This captures corrupt files that cannot be opened at all
             throw new UnprocessableEntityException("Unable to parse Excel file", e);
         }
     }
@@ -172,21 +182,19 @@ public class TicketMetricsService {
             fullMonthName = m.getDisplayName(java.time.format.TextStyle.FULL, Locale.ENGLISH);
         }
 
-        // These internal fields don't exist in current model; we map available values.
+        // Map available values; use defaults for missing parts.
         Integer noOfTicketsReceived = entry.getTotalTickets();
-        Integer noOfTicketsRespondedByTel = null; // not available from model
-        Integer mttrRespondMin = null; // not available from model
+        Integer noOfTicketsRespondedByTel = null;
+        Integer mttrRespondMin = null;
 
-        String adherenceToResponseSLA = null; // not available from model
-        Integer slippedResponseSLA = null; // not available from model
-        String responseAdherenceRate = null; // not available from model
+        String adherenceToResponseSLA = null;
+        Integer slippedResponseSLA = null;
+        String responseAdherenceRate = null;
 
-        Integer noOfTicketsResolvedByTel = null; // not available from model
+        Integer noOfTicketsResolvedByTel = null;
 
-        // MTTRResolveMin derived from mttrHours if available
         Integer mttrResolveMin = (int) Math.round(entry.getMttrHours() * 60.0);
 
-        // AdherenceToResolutionSLA and ResolutionAdherenceRate derived from SLA adherence percent if available
         String adherenceToResolutionSLA = formatPercent(entry.getSlaAdherencePercent());
         String resolutionAdherenceRate = formatPercent(entry.getSlaAdherencePercent());
 
@@ -205,7 +213,7 @@ public class TicketMetricsService {
                 noOfTicketsResolvedByTel,
                 mttrResolveMin,
                 adherenceToResolutionSLA,
-                null, // slippedResolutionSLA - not available from model
+                null,
                 resolutionAdherenceRate,
                 remarks,
                 resolutionRemarks
@@ -213,7 +221,6 @@ public class TicketMetricsService {
     }
 
     private String formatPercent(double value) {
-        // Expecting a number in 0..100; round to nearest integer and add '%'
         long rounded = Math.round(value);
         return rounded + "%";
     }
@@ -224,37 +231,67 @@ public class TicketMetricsService {
         }
         String contentType = file.getContentType();
         String xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-        // Some clients may send different but equivalent types; basic allow-list
         boolean ok = xlsx.equalsIgnoreCase(contentType)
-                || "application/octet-stream".equalsIgnoreCase(contentType) // some proxies
-                || "application/zip".equalsIgnoreCase(contentType); // some libs
+                || "application/octet-stream".equalsIgnoreCase(contentType)
+                || "application/zip".equalsIgnoreCase(contentType);
         if (!ok) {
             throw new BadRequestException("Unsupported content type. Expecting " + xlsx);
         }
-        // Size guard (example: 10 MB)
         long maxBytes = 10L * 1024 * 1024;
         if (file.getSize() > maxBytes) {
             throw new BadRequestException("File too large. Max 10 MB");
         }
-        // Basic filename extension check
         if (file.getOriginalFilename() == null || !file.getOriginalFilename().toLowerCase().endsWith(".xlsx")) {
             throw new BadRequestException("Only .xlsx files are supported");
         }
     }
 
-    private int findColumnIndex(Row headerRow, String... expectedNames) {
-        if (headerRow == null) return -1;
+    /**
+     * Map header names to indices with case-insensitive matching and flexible aliases.
+     * Missing headers are tolerated and represented by -1.
+     */
+    private HeaderMap mapHeaders(Row headerRow) {
+        HeaderMap hm = new HeaderMap();
+        if (headerRow == null) {
+            // No headers at all; everything remains -1
+            return hm;
+        }
+
+        Map<String, Integer> byName = new HashMap<>();
         for (Cell cell : headerRow) {
-            String val = getStringCell(cell);
-            if (val == null) continue;
-            String norm = val.trim().toLowerCase(Locale.ROOT);
-            for (String exp : expectedNames) {
-                if (norm.equals(exp.toLowerCase(Locale.ROOT))) {
-                    return cell.getColumnIndex();
-                }
-            }
+            String s = getStringCell(cell);
+            if (s == null) continue;
+            byName.put(s.trim().toLowerCase(Locale.ROOT), cell.getColumnIndex());
+        }
+
+        hm.colId = findByAliases(byName, "id", "ticket_id", "issue_id", "sr_no", "sr", "no", "number");
+        hm.colCreated = findByAliases(byName, "created_at", "created", "opened_at", "open_date", "created date", "date created");
+        hm.colResolved = findByAliases(byName, "resolved_at", "resolved", "closed_at", "close_date", "resolved date", "date resolved");
+        hm.colPriority = findByAliases(byName, "priority", "prio", "severity", "impact");
+        hm.colSlaHours = findByAliases(byName, "sla_hours", "sla", "target_hours", "target", "resolution_target_hours");
+
+        return hm;
+    }
+
+    private int findByAliases(Map<String, Integer> map, String... aliases) {
+        for (String a : aliases) {
+            Integer idx = map.get(a.toLowerCase(Locale.ROOT));
+            if (idx != null) return idx;
         }
         return -1;
+    }
+
+    private String safeString(Cell cell) {
+        String s = getStringCell(cell);
+        return (s == null || s.isBlank()) ? null : s.trim();
+    }
+
+    private static class HeaderMap {
+        int colId = -1;
+        int colCreated = -1;
+        int colResolved = -1;
+        int colPriority = -1;
+        int colSlaHours = -1;
     }
 
     private String getStringCell(Cell cell) {
@@ -286,7 +323,7 @@ public class TicketMetricsService {
             } else if (cell.getCellType() == CellType.STRING) {
                 String s = cell.getStringCellValue();
                 if (s == null || s.isBlank()) return null;
-                return Double.parseDouble(s.trim());
+                return Double.parseDouble(s.trim().replaceAll(",", ""));
             } else if (cell.getCellType() == CellType.FORMULA) {
                 return cell.getNumericCellValue();
             }
@@ -302,8 +339,17 @@ public class TicketMetricsService {
             } else if (cell.getCellType() == CellType.STRING) {
                 String s = cell.getStringCellValue();
                 if (s == null || s.isBlank()) return null;
-                // Attempt parse as ISO-8601
-                return LocalDateTime.parse(s.trim());
+                // Attempt multiple parses: ISO-8601 or Excel-like "yyyy-MM-dd HH:mm[:ss]"
+                String trimmed = s.trim();
+                try {
+                    return LocalDateTime.parse(trimmed);
+                } catch (Exception ignoreIso) {
+                    // Try a couple of common patterns without bringing new dependencies
+                    // Simple fallback: if date-only pattern "yyyy-MM-dd"
+                    if (trimmed.matches("\\d{4}-\\d{2}-\\d{2}")) {
+                        return LocalDateTime.parse(trimmed + "T00:00:00");
+                    }
+                }
             } else if (cell.getCellType() == CellType.FORMULA) {
                 try {
                     if (DateUtil.isCellDateFormatted(cell)) {

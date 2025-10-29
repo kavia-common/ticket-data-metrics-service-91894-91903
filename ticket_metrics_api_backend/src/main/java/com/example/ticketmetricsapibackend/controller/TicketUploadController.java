@@ -42,7 +42,9 @@ public class TicketUploadController {
     )
     @Operation(
             summary = "Upload Excel and compute ticket metrics",
-            description = "Consumes a .xlsx file with ticket records and returns metrics such as total ticket count, SLA adherence percentage, MTTR (hours), and remarks.",
+            description = "Consumes a .xlsx file with ticket records and returns metrics such as total ticket count, SLA adherence percentage, MTTR (hours), and remarks. " +
+                    "Missing or differently-cased headers are tolerated; metrics are computed from available columns with sensible defaults. " +
+                    "Only non-Excel uploads return 400, and only corrupt/unopenable files return 422.",
             responses = {
                     @ApiResponse(responseCode = "200", description = "Metrics computed successfully",
                             content = @Content(schema = @Schema(implementation = TicketMetricsResponse.class))),
