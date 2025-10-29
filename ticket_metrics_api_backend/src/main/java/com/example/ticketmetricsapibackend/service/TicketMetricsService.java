@@ -1,8 +1,10 @@
 package com.example.ticketmetricsapibackend.service;
 
+import com.example.ticketmetricsapibackend.dto.PagedResponse;
 import com.example.ticketmetricsapibackend.dto.TicketMetricEntry;
 import com.example.ticketmetricsapibackend.dto.TicketMetricsApiResponseDTO;
 import com.example.ticketmetricsapibackend.dto.TicketMetricsResponse;
+import com.example.ticketmetricsapibackend.dto.TicketRow;
 import com.example.ticketmetricsapibackend.exception.BadRequestException;
 import com.example.ticketmetricsapibackend.exception.UnprocessableEntityException;
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -17,6 +19,8 @@ import java.time.LocalDateTime;
 import java.time.Month;
 import java.time.ZoneId;
 import java.util.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
 
 /**
  * PUBLIC_INTERFACE
@@ -30,10 +34,14 @@ public class TicketMetricsService {
     // In a production system, this would be a repository/database.
     private final List<TicketMetricEntry> metricsStore = new ArrayList<>();
 
+    // Thread-safe in-memory store for the most recently parsed rows from upload
+    private final List<TicketRow> lastParsedRows = new ArrayList<>();
+    private final ReentrantReadWriteLock rowsLock = new ReentrantReadWriteLock();
+
     // Expected columns (flexible: will try to find by header names)
     @Schema(description = "Logical header names expected in the uploaded XLSX")
     public enum Header {
-        ID, CREATED_AT, RESOLVED_AT, PRIORITY, SLA_HOURS
+        ID, CREATED_AT, RESOLVED_AT, PRIORITY, SLA_HOURS, APPLICATION
     }
 
     /**
@@ -41,6 +49,7 @@ public class TicketMetricsService {
      * Parse and compute metrics from the provided Excel file.
      * Additionally stores an entry into the in-memory store without specific application/month context.
      * Clients may re-upload per application/month file if they need scoping.
+     * Also persists parsed rows into an in-memory store for later retrieval.
      * @param file uploaded .xlsx file
      * @return TicketMetricsResponse with computed metrics
      */
@@ -52,6 +61,9 @@ public class TicketMetricsService {
         int slaMet = 0;
         double totalResolutionHours = 0.0;
         int resolvedCount = 0;
+
+        // For row persistence
+        List<TicketRow> parsedRows = new ArrayList<>();
 
         try (InputStream is = file.getInputStream(); Workbook workbook = new XSSFWorkbook(is)) {
             if (workbook.getNumberOfSheets() == 0) {
@@ -73,6 +85,16 @@ public class TicketMetricsService {
                 // No data rows, return defaults instead of 422
                 String remarks = buildRemarks(0, 0, 0.0);
                 metricsStore.add(new TicketMetricEntry(null, null, 0, 0.0, 0.0));
+
+                // Persist empty rows list
+                rowsLock.writeLock().lock();
+                try {
+                    lastParsedRows.clear();
+                    lastParsedRows.addAll(parsedRows);
+                } finally {
+                    rowsLock.writeLock().unlock();
+                }
+
                 return new TicketMetricsResponse(0, 0.0, 0.0, remarks, details);
             }
 
@@ -81,34 +103,63 @@ public class TicketMetricsService {
                 Row row = sheet.getRow(r);
                 if (row == null) continue;
 
-                // If there's an ID column but cell is blank, still count but note detail
+                String idStr = (headerMap.colId != -1) ? safeString(row.getCell(headerMap.colId)) : null;
                 if (headerMap.colId != -1) {
-                    String idStr = safeString(row.getCell(headerMap.colId));
                     if (idStr == null || idStr.isBlank()) {
                         details.add("Row " + (r + 1) + ": missing id");
                     }
                 }
 
-                total++;
-
                 LocalDateTime created = (headerMap.colCreated != -1) ? getDateCell(row.getCell(headerMap.colCreated)) : null;
                 LocalDateTime resolved = (headerMap.colResolved != -1) ? getDateCell(row.getCell(headerMap.colResolved)) : null;
                 Double slaHours = (headerMap.colSlaHours != -1) ? getNumericCell(row.getCell(headerMap.colSlaHours)) : null;
+                String application = (headerMap.colApplication != -1) ? safeString(row.getCell(headerMap.colApplication)) : null;
 
-                // MTTR
+                total++;
+
+                // MTTR and resolve minutes
+                double hours = 0.0;
+                int resolveMinutes = 0;
                 if (created != null && resolved != null) {
-                    double hours = Duration.between(created, resolved).toMinutes() / 60.0;
+                    hours = Duration.between(created, resolved).toMinutes() / 60.0;
+                    resolveMinutes = (int) Math.max(Math.round(Duration.between(created, resolved).toMinutes()), 0);
                     totalResolutionHours += Math.max(hours, 0.0);
                     resolvedCount++;
                 }
 
                 // SLA adherence
+                boolean slaOk = false;
                 if (slaHours != null && created != null && resolved != null) {
                     double actual = Duration.between(created, resolved).toMinutes() / 60.0;
                     if (actual <= slaHours + 1e-9) {
                         slaMet++;
+                        slaOk = true;
                     }
                 }
+
+                // Response metrics: not strictly available; default 0 if unknown
+                int responseMinutes = 0;
+                int responseSlaPercent = 0;
+                // Resolution metrics
+                int resolutionSlaPercent = slaOk ? 100 : 0;
+
+                String month = null;
+                if (created != null) {
+                    month = String.format("%04d-%02d", created.getYear(), created.getMonthValue());
+                }
+
+                TicketRow ticketRow = new TicketRow(
+                        idStr,
+                        created,
+                        resolved,
+                        application,
+                        responseMinutes,
+                        resolveMinutes,
+                        responseSlaPercent,
+                        resolutionSlaPercent,
+                        month
+                );
+                parsedRows.add(ticketRow);
             }
 
             double mttr = (resolvedCount > 0) ? (totalResolutionHours / resolvedCount) : 0.0;
@@ -118,6 +169,15 @@ public class TicketMetricsService {
 
             // Store a generic entry (no app/month context known at upload entrypoint)
             metricsStore.add(new TicketMetricEntry(null, null, total, round2(slaPct), round2(mttr)));
+
+            // Persist parsed rows atomically
+            rowsLock.writeLock().lock();
+            try {
+                lastParsedRows.clear();
+                lastParsedRows.addAll(parsedRows);
+            } finally {
+                rowsLock.writeLock().unlock();
+            }
 
             return new TicketMetricsResponse(total, round2(slaPct), round2(mttr), remarks, details);
 
@@ -156,6 +216,63 @@ public class TicketMetricsService {
             filtered.add(entry);
         }
         return filtered;
+    }
+
+    /**
+     * PUBLIC_INTERFACE
+     * Returns parsed ticket rows from the last uploaded Excel, filtered by optional application and month
+     * and paginated according to page/size.
+     * If no file has been uploaded yet, returns an empty page with totalItems=0.
+     *
+     * @param page zero-based page index (>=0)
+     * @param size page size (1..1000)
+     * @param application optional application filter (case-insensitive)
+     * @param month optional month in yyyy-MM
+     * @return paged response with TicketRow items
+     */
+    public PagedResponse<TicketRow> getParsedRows(int page, int size, String application, String month) {
+        List<TicketRow> snapshot;
+        rowsLock.readLock().lock();
+        try {
+            snapshot = new ArrayList<>(lastParsedRows);
+        } finally {
+            rowsLock.readLock().unlock();
+        }
+
+        if (snapshot.isEmpty()) {
+            return new PagedResponse<>(page, size, 0, 0, Collections.emptyList());
+        }
+
+        // Filter
+        List<TicketRow> filtered = snapshot.stream()
+                .filter(tr -> {
+                    if (application != null && !application.isBlank()) {
+                        String a = tr.getApplication();
+                        if (a == null || !a.equalsIgnoreCase(application)) {
+                            return false;
+                        }
+                    }
+                    if (month != null && !month.isBlank()) {
+                        String m = tr.getMonth();
+                        if (m == null || !m.equals(month)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                })
+                .collect(Collectors.toList());
+
+        long total = filtered.size();
+        if (total == 0) {
+            return new PagedResponse<>(page, size, 0, 0, Collections.emptyList());
+        }
+
+        int totalPages = (int) Math.ceil(total / (double) size);
+        int from = Math.min(page * size, filtered.size());
+        int to = Math.min(from + size, filtered.size());
+        List<TicketRow> pageItems = filtered.subList(from, to);
+
+        return new PagedResponse<>(page, size, total, totalPages, pageItems);
     }
 
     /**
@@ -269,6 +386,7 @@ public class TicketMetricsService {
         hm.colResolved = findByAliases(byName, "resolved_at", "resolved", "closed_at", "close_date", "resolved date", "date resolved");
         hm.colPriority = findByAliases(byName, "priority", "prio", "severity", "impact");
         hm.colSlaHours = findByAliases(byName, "sla_hours", "sla", "target_hours", "target", "resolution_target_hours");
+        hm.colApplication = findByAliases(byName, "application", "app", "service", "project");
 
         return hm;
     }
@@ -292,6 +410,7 @@ public class TicketMetricsService {
         int colResolved = -1;
         int colPriority = -1;
         int colSlaHours = -1;
+        int colApplication = -1;
     }
 
     private String getStringCell(Cell cell) {
