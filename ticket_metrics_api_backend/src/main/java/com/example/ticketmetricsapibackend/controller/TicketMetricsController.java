@@ -1,6 +1,7 @@
 package com.example.ticketmetricsapibackend.controller;
 
 import com.example.ticketmetricsapibackend.dto.TicketMetricEntry;
+import com.example.ticketmetricsapibackend.dto.TicketMetricsApiResponseDTO;
 import com.example.ticketmetricsapibackend.exception.BadRequestException;
 import com.example.ticketmetricsapibackend.service.TicketMetricsService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * Controller that exposes read endpoints for ticket metrics.
@@ -52,11 +54,11 @@ public class TicketMetricsController {
                     "If no matches are found, returns an empty array.",
             responses = {
                     @ApiResponse(responseCode = "200", description = "Metrics retrieved",
-                            content = @Content(array = @ArraySchema(schema = @Schema(implementation = TicketMetricEntry.class)))),
+                            content = @Content(array = @ArraySchema(schema = @Schema(implementation = TicketMetricsApiResponseDTO.class)))),
                     @ApiResponse(responseCode = "400", description = "Invalid parameters", content = @Content)
             }
     )
-    public ResponseEntity<List<TicketMetricEntry>> getMetrics(
+    public ResponseEntity<List<TicketMetricsApiResponseDTO>> getMetrics(
             @Parameter(description = "Application name to filter") @RequestParam(name = "application", required = false) String application,
             @Parameter(description = "Month in yyyy-MM format (e.g., 2024-07)") @RequestParam(name = "month", required = false) String month
     ) {
@@ -64,7 +66,11 @@ public class TicketMetricsController {
             throw new BadRequestException("Invalid 'month' format. Expected yyyy-MM.");
         }
 
-        List<TicketMetricEntry> result = ticketMetricsService.getMetrics(application, month);
+        List<TicketMetricEntry> filtered = ticketMetricsService.getMetrics(application, month);
+        List<TicketMetricsApiResponseDTO> result = filtered.stream()
+                .map(ticketMetricsService::mapToApiDto)
+                .collect(Collectors.toList());
+
         return ResponseEntity.ok(result);
     }
 }

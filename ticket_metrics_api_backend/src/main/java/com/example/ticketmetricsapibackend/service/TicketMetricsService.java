@@ -1,6 +1,7 @@
 package com.example.ticketmetricsapibackend.service;
 
 import com.example.ticketmetricsapibackend.dto.TicketMetricEntry;
+import com.example.ticketmetricsapibackend.dto.TicketMetricsApiResponseDTO;
 import com.example.ticketmetricsapibackend.dto.TicketMetricsResponse;
 import com.example.ticketmetricsapibackend.exception.BadRequestException;
 import com.example.ticketmetricsapibackend.exception.UnprocessableEntityException;
@@ -13,11 +14,11 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.InputStream;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.Month;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
 
 /**
  * PUBLIC_INTERFACE
@@ -145,6 +146,76 @@ public class TicketMetricsService {
             filtered.add(entry);
         }
         return filtered;
+    }
+
+    /**
+     * PUBLIC_INTERFACE
+     * Maps an internal TicketMetricEntry to the API response DTO enforcing the requested shape.
+     * This is unit-test friendly and can be used by controllers/services.
+     *
+     * Month formatting rules:
+     * - If entry.getMonth() provided in 'yyyy-MM', converts to full month name using English locale.
+     * - If null/blank/unparseable, returns null for Month.
+     *
+     * Percentage fields are formatted as "<value>%", rounding to nearest integer for whole-number display.
+     */
+    public TicketMetricsApiResponseDTO mapToApiDto(TicketMetricEntry entry) {
+        if (entry == null) return null;
+
+        String application = entry.getApplication();
+
+        String fullMonthName = null;
+        String ym = entry.getMonth();
+        if (ym != null && ym.matches("^[0-9]{4}-(0[1-9]|1[0-2])$")) {
+            int monthNumber = Integer.parseInt(ym.substring(5, 7)); // 01..12
+            Month m = Month.of(monthNumber);
+            fullMonthName = m.getDisplayName(java.time.format.TextStyle.FULL, Locale.ENGLISH);
+        }
+
+        // These internal fields don't exist in current model; we map available values.
+        Integer noOfTicketsReceived = entry.getTotalTickets();
+        Integer noOfTicketsRespondedByTel = null; // not available from model
+        Integer mttrRespondMin = null; // not available from model
+
+        String adherenceToResponseSLA = null; // not available from model
+        Integer slippedResponseSLA = null; // not available from model
+        String responseAdherenceRate = null; // not available from model
+
+        Integer noOfTicketsResolvedByTel = null; // not available from model
+
+        // MTTRResolveMin derived from mttrHours if available
+        Integer mttrResolveMin = (int) Math.round(entry.getMttrHours() * 60.0);
+
+        // AdherenceToResolutionSLA and ResolutionAdherenceRate derived from SLA adherence percent if available
+        String adherenceToResolutionSLA = formatPercent(entry.getSlaAdherencePercent());
+        String resolutionAdherenceRate = formatPercent(entry.getSlaAdherencePercent());
+
+        String remarks = null;
+        String resolutionRemarks = null;
+
+        return new TicketMetricsApiResponseDTO(
+                application,
+                fullMonthName,
+                noOfTicketsReceived,
+                noOfTicketsRespondedByTel,
+                mttrRespondMin,
+                adherenceToResponseSLA,
+                slippedResponseSLA,
+                responseAdherenceRate,
+                noOfTicketsResolvedByTel,
+                mttrResolveMin,
+                adherenceToResolutionSLA,
+                null, // slippedResolutionSLA - not available from model
+                resolutionAdherenceRate,
+                remarks,
+                resolutionRemarks
+        );
+    }
+
+    private String formatPercent(double value) {
+        // Expecting a number in 0..100; round to nearest integer and add '%'
+        long rounded = Math.round(value);
+        return rounded + "%";
     }
 
     private void validateFile(MultipartFile file) {

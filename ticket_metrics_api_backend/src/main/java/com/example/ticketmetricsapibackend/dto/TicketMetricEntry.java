@@ -6,7 +6,8 @@ import java.time.YearMonth;
 
 /**
  * PUBLIC_INTERFACE
- * Represents a single metric entry for tickets, optionally scoped by application and month.
+ * Represents a single internal metric entry for tickets, optionally scoped by application and month.
+ * This model is not the public API shape; it is mapped to TicketMetricsApiResponseDTO for responses.
  */
 public class TicketMetricEntry {
 
